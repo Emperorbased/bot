@@ -1,8 +1,11 @@
 import logging
 import time
+import os
 from datetime import datetime, timedelta
+from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from flask import Flask
 
 # Настройка логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -11,32 +14,46 @@ logger = logging.getLogger(__name__)
 # Токен бота
 TOKEN = "8546823235:AAFI-3t1SCB9S4PI5izbAAz1XEwHjRlL-6E"
 
-# Главные администраторы (могут добавлять других админов)
+# Главные администраторы
 SUPER_ADMINS = {7355737254, 8243127223, 8167127645}
-
-# Все администраторы (включая добавленных)
 admins = SUPER_ADMINS.copy()
 
-# Состояния для ConversationHandler
-WAITING_APPEAL, WAITING_COMPLAINT, WAITING_ADMIN_ID, WAITING_RESPONSE, WAITING_BAN_DURATION, WAITING_BAN_REASON = range(6)
+# Состояния
+WAITING_APPEAL, WAITING_COMPLAINT, WAITING_ADMIN_ID, WAITING_RESPONSE, WAITING_BAN_DURATION, WAITING_BAN_REASON, IN_CHAT = range(7)
 
-# Хранилище жалоб и банов
+# Хранилище
 appeals = {}
 appeal_counter = 0
-banned_users = {}  # {user_id: {'until': timestamp, 'reason': str}}
+banned_users = {}
+active_chats = {}
+
+# Flask для Render
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+@app.route('/health')
+def health():
+    return "OK"
+
+def run_flask():
+    """Запуск Flask в отдельном потоке"""
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port)
 
 def is_user_banned(user_id):
-    """Проверка, забанен ли пользователь"""
+    """Проверка бана"""
     if user_id in banned_users:
         if time.time() < banned_users[user_id]['until']:
             return True, banned_users[user_id]['reason'], banned_users[user_id]['until']
         else:
-            # Бан истек
             del banned_users[user_id]
     return False, None, None
 
 def parse_duration(duration_str):
-    """Парсинг строки времени (1m, 1h, 1d) в секунды"""
+    """Парсинг времени"""
     duration_str = duration_str.strip().lower()
     
     if duration_str[-1] == 'm':
@@ -49,10 +66,9 @@ def parse_duration(duration_str):
         return None, None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start"""
+    """Команда /start"""
     user_id = update.message.from_user.id
     
-    # Проверка бана
     is_banned, reason, until = is_user_banned(user_id)
     if is_banned:
         ban_end = datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')
@@ -64,7 +80,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("Обжаловать наказание", callback_data="appeal")],
-        [InlineKeyboardButton("Жалоба на персонал", callback_data="complaint")]
+        [InlineKeyboardButton("Жалоба на персонал", callback_data="complaint")],
+        [InlineKeyboardButton("💬 Чат с администратором", callback_data="start_chat")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -75,113 +92,185 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатий на кнопки"""
+    """Обработка кнопок"""
     query = update.callback_query
     await query.answer()
     
     user_id = query.from_user.id
     
     if query.data == "appeal":
-        # Проверка бана
         is_banned, reason, until = is_user_banned(user_id)
         if is_banned:
             ban_end = datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')
-            await query.edit_message_text(
-                f"🚫 Вы заблокированы в боте до {ban_end}\n\n"
-                f"Причина: {reason}"
-            )
+            await query.edit_message_text(f"🚫 Вы заблокированы в боте до {ban_end}\n\nПричина: {reason}")
             return ConversationHandler.END
             
-        await query.edit_message_text(
-            "📝 Опишите какое наказание вам дали и почему его нужно обжаловать:"
-        )
+        await query.edit_message_text("📝 Опишите какое наказание вам дали и почему его нужно обжаловать:")
         return WAITING_APPEAL
     
     elif query.data == "complaint":
-        # Проверка бана
         is_banned, reason, until = is_user_banned(user_id)
         if is_banned:
             ban_end = datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')
-            await query.edit_message_text(
-                f"🚫 Вы заблокированы в боте до {ban_end}\n\n"
-                f"Причина: {reason}"
-            )
+            await query.edit_message_text(f"🚫 Вы заблокированы в боте до {ban_end}\n\nПричина: {reason}")
             return ConversationHandler.END
             
-        await query.edit_message_text(
-            "📝 Опишите вашу жалобу на персонал:"
-        )
+        await query.edit_message_text("📝 Опишите вашу жалобу на персонал:")
         return WAITING_COMPLAINT
     
+    elif query.data == "start_chat":
+        if user_id in active_chats:
+            await query.edit_message_text("💬 У вас уже есть активный чат с администратором.\nПросто напишите ваше сообщение.")
+            return IN_CHAT
+        
+        keyboard = [[InlineKeyboardButton("Начать диалог", callback_data=f"accept_chat_{user_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        for admin_id in admins:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=f"💬 Пользователь @{query.from_user.username or query.from_user.first_name} (ID: {user_id}) запросил чат",
+                    reply_markup=reply_markup
+                )
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+        
+        await query.edit_message_text("✅ Запрос на чат отправлен.\nОжидайте подключения...")
+        return ConversationHandler.END
+    
+    elif query.data.startswith("accept_chat_"):
+        chat_user_id = int(query.data.split("_")[2])
+        admin_id = query.from_user.id
+        
+        if chat_user_id in active_chats:
+            await query.answer("⚠️ Этот чат уже занят!", show_alert=True)
+            return ConversationHandler.END
+        
+        active_chats[chat_user_id] = admin_id
+        
+        try:
+            keyboard = [[InlineKeyboardButton("Завершить диалог", callback_data="end_chat_user")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await context.bot.send_message(
+                chat_id=chat_user_id,
+                text=f"💬 Администратор подключился к чату!\nМожете писать.",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Ошибка: {e}")
+        
+        keyboard = [[InlineKeyboardButton("Завершить диалог", callback_data=f"end_chat_admin_{chat_user_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            f"✅ Вы подключились к чату с пользователем (ID: {chat_user_id})\nПишите сообщения.",
+            reply_markup=reply_markup
+        )
+        return ConversationHandler.END
+    
+    elif query.data == "end_chat_user":
+        if user_id in active_chats:
+            admin_id = active_chats[user_id]
+            del active_chats[user_id]
+            
+            try:
+                await context.bot.send_message(chat_id=admin_id, text="💬 Пользователь завершил диалог.")
+            except:
+                pass
+            
+            await query.edit_message_text("✅ Диалог завершен.")
+        else:
+            await query.answer("У вас нет активного чата", show_alert=True)
+        return ConversationHandler.END
+    
+    elif query.data.startswith("end_chat_admin_"):
+        chat_user_id = int(query.data.split("_")[3])
+        
+        if chat_user_id in active_chats:
+            del active_chats[chat_user_id]
+            
+            try:
+                await context.bot.send_message(chat_id=chat_user_id, text="💬 Администратор завершил диалог.")
+            except:
+                pass
+            
+            await query.edit_message_text("✅ Диалог завершен.")
+        else:
+            await query.answer("Чат уже завершен", show_alert=True)
+        return ConversationHandler.END
+    
     elif query.data.startswith("respond_"):
-        # Админ хочет ответить на жалобу
         appeal_id = int(query.data.split("_")[1])
         context.user_data['responding_to'] = appeal_id
-        await query.edit_message_text(
-            f"{query.message.text}\n\n"
-            "✍️ Напишите ваш ответ:"
-        )
+        await query.edit_message_text(f"{query.message.text}\n\n✍️ Напишите ваш ответ:")
         return WAITING_RESPONSE
     
     elif query.data.startswith("ban_"):
-        # Админ хочет забанить пользователя
         appeal_id = int(query.data.split("_")[1])
         if appeal_id in appeals:
             context.user_data['banning_appeal'] = appeal_id
             await query.edit_message_text(
                 f"{query.message.text}\n\n"
-                "⏱ Введите время бана:\n"
-                "Примеры: 1m (1 минута), 5m (5 минут), 1h (1 час), 12h (12 часов), 1d (1 день), 7d (7 дней)"
+                "⏱ Введите время бана:\nПримеры: 1m, 5m, 1h, 12h, 1d, 7d"
             )
             return WAITING_BAN_DURATION
     
     elif query.data.startswith("close_"):
-        # Админ закрывает жалобу
         appeal_id = int(query.data.split("_")[1])
         if appeal_id in appeals:
             user_id = appeals[appeal_id]['user_id']
             appeal_type = appeals[appeal_id]['type']
             
-            # Уведомляем пользователя
             try:
                 await context.bot.send_message(
                     chat_id=user_id,
-                    text=f"✅ Ваша {'жалоба' if appeal_type == 'complaint' else 'апелляция'} #{appeal_id} была закрыта администратором."
+                    text=f"✅ Ваша {'жалоба' if appeal_type == 'complaint' else 'апелляция'} #{appeal_id} закрыта."
                 )
             except:
                 pass
             
-            # Удаляем жалобу из системы
             del appeals[appeal_id]
-            
-            await query.edit_message_text(
-                f"{query.message.text}\n\n"
-                f"🔒 Жалоба закрыта администратором @{query.from_user.username or query.from_user.first_name}"
-            )
+            await query.edit_message_text(f"{query.message.text}\n\n🔒 Жалоба закрыта")
         return ConversationHandler.END
 
-async def receive_appeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение текста обжалования"""
-    global appeal_counter
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка сообщений в чатах"""
+    user_id = update.message.from_user.id
+    text = update.message.text
     
+    if user_id in active_chats:
+        admin_id = active_chats[user_id]
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=f"💬 Сообщение от @{update.message.from_user.username or update.message.from_user.first_name}:\n\n{text}"
+            )
+        except Exception as e:
+            logger.error(f"Ошибка: {e}")
+    else:
+        for chat_user_id, admin_id in active_chats.items():
+            if admin_id == user_id:
+                try:
+                    await context.bot.send_message(chat_id=chat_user_id, text=f"💬 Администратор:\n\n{text}")
+                    return
+                except Exception as e:
+                    logger.error(f"Ошибка: {e}")
+
+async def receive_appeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получение обжалования"""
+    global appeal_counter
     user_id = update.message.from_user.id
     
-    # Проверка бана
     is_banned, reason, until = is_user_banned(user_id)
     if is_banned:
         ban_end = datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')
-        await update.message.reply_text(
-            f"🚫 Вы заблокированы в боте до {ban_end}\n\n"
-            f"Причина: {reason}"
-        )
+        await update.message.reply_text(f"🚫 Вы заблокированы до {ban_end}\n\nПричина: {reason}")
         return ConversationHandler.END
     
     appeal_counter += 1
-    
     user = update.message.from_user
     appeal_text = update.message.text
     
-    # Сохраняем жалобу
     appeals[appeal_counter] = {
         'user_id': user.id,
         'username': user.username or user.first_name,
@@ -189,16 +278,12 @@ async def receive_appeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'type': 'appeal'
     }
     
-    await update.message.reply_text(
-        f"✅ Ваше обжалование #{appeal_counter} отправлено администрации!\n"
-        "Ожидайте ответа."
-    )
+    await update.message.reply_text(f"✅ Обжалование #{appeal_counter} отправлено!")
     
-    # Отправляем всем админам
     keyboard = [
         [InlineKeyboardButton("Ответить", callback_data=f"respond_{appeal_counter}")],
         [InlineKeyboardButton("Временный бан", callback_data=f"ban_{appeal_counter}")],
-        [InlineKeyboardButton("Закрыть жалобу", callback_data=f"close_{appeal_counter}")]
+        [InlineKeyboardButton("Закрыть", callback_data=f"close_{appeal_counter}")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -208,36 +293,29 @@ async def receive_appeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=admin_id,
                 text=f"🔔 Новое обжалование #{appeal_counter}\n\n"
                      f"👤 От: @{user.username or user.first_name} (ID: {user.id})\n"
-                     f"📝 Текст:\n{appeal_text}",
+                     f"📝 {appeal_text}",
                 reply_markup=reply_markup
             )
         except Exception as e:
-            logger.error(f"Не удалось отправить сообщение админу {admin_id}: {e}")
+            logger.error(f"Ошибка: {e}")
     
     return ConversationHandler.END
 
 async def receive_complaint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение текста жалобы на персонал"""
+    """Получение жалобы"""
     global appeal_counter
-    
     user_id = update.message.from_user.id
     
-    # Проверка бана
     is_banned, reason, until = is_user_banned(user_id)
     if is_banned:
         ban_end = datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')
-        await update.message.reply_text(
-            f"🚫 Вы заблокированы в боте до {ban_end}\n\n"
-            f"Причина: {reason}"
-        )
+        await update.message.reply_text(f"🚫 Вы заблокированы до {ban_end}\n\nПричина: {reason}")
         return ConversationHandler.END
     
     appeal_counter += 1
-    
     user = update.message.from_user
     complaint_text = update.message.text
     
-    # Сохраняем жалобу
     appeals[appeal_counter] = {
         'user_id': user.id,
         'username': user.username or user.first_name,
@@ -245,16 +323,12 @@ async def receive_complaint(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'type': 'complaint'
     }
     
-    await update.message.reply_text(
-        f"✅ Ваша жалоба #{appeal_counter} отправлена администрации!\n"
-        "Ожидайте ответа."
-    )
+    await update.message.reply_text(f"✅ Жалоба #{appeal_counter} отправлена!")
     
-    # Отправляем всем админам
     keyboard = [
         [InlineKeyboardButton("Ответить", callback_data=f"respond_{appeal_counter}")],
         [InlineKeyboardButton("Временный бан", callback_data=f"ban_{appeal_counter}")],
-        [InlineKeyboardButton("Закрыть жалобу", callback_data=f"close_{appeal_counter}")]
+        [InlineKeyboardButton("Закрыть", callback_data=f"close_{appeal_counter}")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -262,13 +336,13 @@ async def receive_complaint(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
-                text=f"🔔 Новая жалоба на персонал #{appeal_counter}\n\n"
+                text=f"🔔 Жалоба на персонал #{appeal_counter}\n\n"
                      f"👤 От: @{user.username or user.first_name} (ID: {user.id})\n"
-                     f"📝 Текст:\n{complaint_text}",
+                     f"📝 {complaint_text}",
                 reply_markup=reply_markup
             )
         except Exception as e:
-            logger.error(f"Не удалось отправить сообщение админу {admin_id}: {e}")
+            logger.error(f"Ошибка: {e}")
     
     return ConversationHandler.END
 
@@ -278,74 +352,53 @@ async def receive_ban_duration(update: Update, context: ContextTypes.DEFAULT_TYP
     appeal_id = context.user_data.get('banning_appeal')
     
     if not appeal_id or appeal_id not in appeals:
-        await update.message.reply_text("❌ Ошибка: жалоба не найдена")
+        await update.message.reply_text("❌ Ошибка")
         return ConversationHandler.END
     
     seconds, readable = parse_duration(duration_str)
     
     if seconds is None:
-        await update.message.reply_text(
-            "❌ Неверный формат времени!\n"
-            "Используйте: 1m (минуты), 1h (часы), 1d (дни)\n"
-            "Попробуйте снова:"
-        )
+        await update.message.reply_text("❌ Неверный формат!\nИспользуйте: 1m, 1h, 1d")
         return WAITING_BAN_DURATION
     
     context.user_data['ban_duration'] = seconds
     context.user_data['ban_duration_readable'] = readable
     
-    await update.message.reply_text(
-        f"✅ Время бана: {readable}\n\n"
-        "📝 Теперь введите причину бана:"
-    )
+    await update.message.reply_text(f"✅ Время: {readable}\n\n📝 Введите причину:")
     return WAITING_BAN_REASON
 
 async def receive_ban_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение причины бана и применение"""
+    """Применение бана"""
     reason = update.message.text
     appeal_id = context.user_data.get('banning_appeal')
     duration = context.user_data.get('ban_duration')
     duration_readable = context.user_data.get('ban_duration_readable')
     
     if not appeal_id or appeal_id not in appeals:
-        await update.message.reply_text("❌ Ошибка: жалоба не найдена")
+        await update.message.reply_text("❌ Ошибка")
         return ConversationHandler.END
     
     user_id = appeals[appeal_id]['user_id']
     username = appeals[appeal_id]['username']
     
-    # Применяем бан
     ban_until = time.time() + duration
-    banned_users[user_id] = {
-        'until': ban_until,
-        'reason': reason
-    }
+    banned_users[user_id] = {'until': ban_until, 'reason': reason}
     
     ban_end = datetime.fromtimestamp(ban_until).strftime('%d.%m.%Y %H:%M')
     
-    # Уведомляем пользователя
     try:
         await context.bot.send_message(
             chat_id=user_id,
-            text=f"🚫 Вы были заблокированы в боте на {duration_readable}\n"
-                 f"До: {ban_end}\n\n"
-                 f"Причина: {reason}"
+            text=f"🚫 Вы забанены на {duration_readable}\nДо: {ban_end}\n\nПричина: {reason}"
         )
     except:
         pass
     
-    # Уведомляем админа
     await update.message.reply_text(
-        f"✅ Пользователь @{username} (ID: {user_id}) забанен!\n"
-        f"Время: {duration_readable}\n"
-        f"До: {ban_end}\n"
-        f"Причина: {reason}"
+        f"✅ @{username} (ID: {user_id}) забанен!\nВремя: {duration_readable}\nДо: {ban_end}"
     )
     
-    # Закрываем жалобу
     del appeals[appeal_id]
-    
-    # Очищаем данные
     context.user_data.pop('banning_appeal', None)
     context.user_data.pop('ban_duration', None)
     context.user_data.pop('ban_duration_readable', None)
@@ -353,84 +406,74 @@ async def receive_ban_reason(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 async def receive_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение ответа от админа"""
+    """Ответ админа"""
     appeal_id = context.user_data.get('responding_to')
     
     if appeal_id and appeal_id in appeals:
         user_id = appeals[appeal_id]['user_id']
         response_text = update.message.text
         
-        # Отправляем ответ пользователю
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text=f"💬 Ответ администратора на вашу жалобу #{appeal_id}:\n\n"
-                     f"{response_text}"
+                text=f"💬 Ответ на жалобу #{appeal_id}:\n\n{response_text}"
             )
-            await update.message.reply_text("✅ Ответ отправлен пользователю!")
+            await update.message.reply_text("✅ Ответ отправлен!")
             
-            # Предлагаем закрыть жалобу
-            keyboard = [[InlineKeyboardButton("Закрыть жалобу", callback_data=f"close_{appeal_id}")]]
+            keyboard = [[InlineKeyboardButton("Закрыть", callback_data=f"close_{appeal_id}")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await update.message.reply_text(
-                "Хотите закрыть эту жалобу?",
-                reply_markup=reply_markup
-            )
+            await update.message.reply_text("Закрыть жалобу?", reply_markup=reply_markup)
         except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка отправки ответа: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {e}")
     
     context.user_data.pop('responding_to', None)
     return ConversationHandler.END
 
 async def addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для добавления нового админа (только для супер-админов)"""
+    """Добавление админа"""
     user_id = update.message.from_user.id
     
     if user_id not in SUPER_ADMINS:
-        await update.message.reply_text("❌ У вас нет прав для добавления администраторов.")
+        await update.message.reply_text("❌ Нет прав")
         return ConversationHandler.END
     
-    await update.message.reply_text(
-        "👤 Отправьте ID пользователя, которого хотите добавить в администраторы:"
-    )
+    await update.message.reply_text("👤 Отправьте ID:")
     return WAITING_ADMIN_ID
 
 async def receive_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение ID нового админа"""
+    """Получение ID админа"""
     try:
         new_admin_id = int(update.message.text)
         
         if new_admin_id in admins:
-            await update.message.reply_text("⚠️ Этот пользователь уже является администратором.")
+            await update.message.reply_text("⚠️ Уже админ")
         else:
             admins.add(new_admin_id)
-            await update.message.reply_text(
-                f"✅ Пользователь {new_admin_id} добавлен в администраторы!"
-            )
+            await update.message.reply_text(f"✅ {new_admin_id} добавлен!")
             
-            # Уведомляем нового админа
             try:
-                await context.bot.send_message(
-                    chat_id=new_admin_id,
-                    text="🎉 Вы были назначены администратором бота!"
-                )
+                await context.bot.send_message(chat_id=new_admin_id, text="🎉 Вы теперь админ!")
             except:
                 pass
     except ValueError:
-        await update.message.reply_text("❌ Неверный формат ID. Введите числовой ID пользователя.")
+        await update.message.reply_text("❌ Неверный ID")
     
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена текущего действия"""
-    await update.message.reply_text("❌ Действие отменено.")
+    """Отмена"""
+    await update.message.reply_text("❌ Отменено")
     return ConversationHandler.END
 
 def main():
-    """Запуск бота"""
+    """Запуск"""
+    # Запуск Flask в отдельном потоке
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
     application = Application.builder().token(TOKEN).build()
     
-    # ConversationHandler для обжалований
     appeal_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler, pattern="^(appeal|complaint)$")],
         states={
@@ -441,7 +484,6 @@ def main():
         per_message=False
     )
     
-    # ConversationHandler для ответов админов
     response_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler, pattern="^respond_")],
         states={
@@ -451,7 +493,6 @@ def main():
         per_message=False
     )
     
-    # ConversationHandler для банов
     ban_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler, pattern="^ban_")],
         states={
@@ -462,7 +503,6 @@ def main():
         per_message=False
     )
     
-    # ConversationHandler для добавления админов
     addadmin_handler = ConversationHandler(
         entry_points=[CommandHandler("addadmin", addadmin)],
         states={
@@ -471,15 +511,14 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     
-    # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(appeal_handler)
     application.add_handler(response_handler)
     application.add_handler(ban_handler)
     application.add_handler(addadmin_handler)
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^close_"))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Запуск бота
     logger.info("Бот запущен!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
