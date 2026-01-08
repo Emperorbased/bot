@@ -147,14 +147,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⚠️ Этот чат уже занят!", show_alert=True)
             return ConversationHandler.END
         
-        active_chats[chat_user_id] = admin_id
+        # Создаем чат с сохранением имени пользователя
+        try:
+            user_info = await context.bot.get_chat(chat_user_id)
+            username = user_info.username if user_info.username else user_info.first_name
+        except:
+            username = "Unknown"
+        
+        active_chats[chat_user_id] = {
+            'admin_id': admin_id,
+            'username': username,
+            'admin_username': query.from_user.username or query.from_user.first_name
+        }
         
         try:
             keyboard = [[InlineKeyboardButton("Завершить диалог", callback_data="end_chat_user")]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             await context.bot.send_message(
                 chat_id=chat_user_id,
-                text=f"💬 Администратор подключился к чату!\nМожете писать.",
+                text=f"💬 Администратор @{query.from_user.username or query.from_user.first_name} подключился к чату!\nМожете писать.",
                 reply_markup=reply_markup
             )
         except Exception as e:
@@ -163,7 +174,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("Завершить диалог", callback_data=f"end_chat_admin_{chat_user_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            f"✅ Вы подключились к чату с пользователем (ID: {chat_user_id})\nПишите сообщения.",
+            f"✅ Вы подключились к чату с @{username} (ID: {chat_user_id})\nПишите сообщения.",
             reply_markup=reply_markup
         )
         return ConversationHandler.END
@@ -235,34 +246,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка сообщений в чатах"""
+    if not update.message or not update.message.text:
+        return
+    
     user_id = update.message.from_user.id
     text = update.message.text
+    username = update.message.from_user.username or update.message.from_user.first_name
     
     # Проверяем, пользователь в чате
     if user_id in active_chats:
-        admin_id = active_chats[user_id]
+        chat_info = active_chats[user_id]
+        admin_id = chat_info['admin_id']
         try:
             await context.bot.send_message(
                 chat_id=admin_id,
-                text=f"💬 Сообщение от @{update.message.from_user.username or update.message.from_user.first_name}:\n\n{text}"
+                text=f"💬 Сообщение от @{username}:\n\n{text}"
             )
-            return  # Важно! Выходим после отправки
+            logger.info(f"Сообщение от пользователя {username} ({user_id}) отправлено админу {admin_id}")
         except Exception as e:
             logger.error(f"Ошибка отправки админу: {e}")
-            return
+        return
     
     # Проверяем, админ в чате
-    for chat_user_id, admin_id in list(active_chats.items()):
-        if admin_id == user_id:
+    for chat_user_id, chat_info in list(active_chats.items()):
+        if chat_info['admin_id'] == user_id:
             try:
+                user_username = chat_info['username']
+                admin_username = chat_info['admin_username']
                 await context.bot.send_message(
                     chat_id=chat_user_id,
-                    text=f"💬 Администратор:\n\n{text}"
+                    text=f"💬 Администратор @{admin_username}:\n\n{text}"
                 )
-                return  # Важно! Выходим после отправки
+                logger.info(f"Сообщение от админа {username} ({user_id}) отправлено пользователю {user_username} ({chat_user_id})")
             except Exception as e:
                 logger.error(f"Ошибка отправки пользователю: {e}")
-                return
+            return
 
 async def receive_appeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получение обжалования"""
