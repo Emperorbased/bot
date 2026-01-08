@@ -238,6 +238,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     text = update.message.text
     
+    # Проверяем, пользователь в чате
     if user_id in active_chats:
         admin_id = active_chats[user_id]
         try:
@@ -245,16 +246,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=admin_id,
                 text=f"💬 Сообщение от @{update.message.from_user.username or update.message.from_user.first_name}:\n\n{text}"
             )
+            return  # Важно! Выходим после отправки
         except Exception as e:
-            logger.error(f"Ошибка: {e}")
-    else:
-        for chat_user_id, admin_id in active_chats.items():
-            if admin_id == user_id:
-                try:
-                    await context.bot.send_message(chat_id=chat_user_id, text=f"💬 Администратор:\n\n{text}")
-                    return
-                except Exception as e:
-                    logger.error(f"Ошибка: {e}")
+            logger.error(f"Ошибка отправки админу: {e}")
+            return
+    
+    # Проверяем, админ в чате
+    for chat_user_id, admin_id in list(active_chats.items()):
+        if admin_id == user_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_user_id,
+                    text=f"💬 Администратор:\n\n{text}"
+                )
+                return  # Важно! Выходим после отправки
+            except Exception as e:
+                logger.error(f"Ошибка отправки пользователю: {e}")
+                return
 
 async def receive_appeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получение обжалования"""
@@ -511,13 +519,15 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     
+    # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(appeal_handler)
     application.add_handler(response_handler)
     application.add_handler(ban_handler)
     application.add_handler(addadmin_handler)
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # ВАЖНО: handle_message должен быть ПОСЛЕДНИМ с низким приоритетом
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message), group=10)
     
     logger.info("Бот запущен!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
