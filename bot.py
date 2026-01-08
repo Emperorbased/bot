@@ -19,13 +19,13 @@ SUPER_ADMINS = {7355737254, 8243127223, 8167127645}
 admins = SUPER_ADMINS.copy()
 
 # Состояния
-WAITING_APPEAL, WAITING_COMPLAINT, WAITING_ADMIN_ID, WAITING_RESPONSE, WAITING_BAN_DURATION, WAITING_BAN_REASON, IN_CHAT = range(7)
+WAITING_APPEAL, WAITING_COMPLAINT, WAITING_ADMIN_ID, WAITING_RESPONSE, WAITING_BAN_DURATION, WAITING_BAN_REASON = range(6)
 
 # Хранилище
 appeals = {}
 appeal_counter = 0
 banned_users = {}
-active_chats = {}
+active_chats = {}  # {user_id: {'admin_id': int, 'username': str, 'admin_username': str}}
 
 # Flask для Render
 app = Flask(__name__)
@@ -121,7 +121,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "start_chat":
         if user_id in active_chats:
             await query.edit_message_text("💬 У вас уже есть активный чат с администратором.\nПросто напишите ваше сообщение.")
-            return IN_CHAT
+            return
         
         keyboard = [[InlineKeyboardButton("Начать диалог", callback_data=f"accept_chat_{user_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -147,7 +147,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⚠️ Этот чат уже занят!", show_alert=True)
             return ConversationHandler.END
         
-        # Создаем чат с сохранением имени пользователя
+        # Создаем чат
         try:
             user_info = await context.bot.get_chat(chat_user_id)
             username = user_info.username if user_info.username else user_info.first_name
@@ -165,7 +165,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup = InlineKeyboardMarkup(keyboard)
             await context.bot.send_message(
                 chat_id=chat_user_id,
-                text=f"💬 Администратор @{query.from_user.username or query.from_user.first_name} подключился к чату!\nМожете писать.",
+                text=f"💬 Администратор @{query.from_user.username or query.from_user.first_name} подключился к чату!\n\n"
+                     f"Все ваши сообщения теперь будут переслаты администратору.",
                 reply_markup=reply_markup
             )
         except Exception as e:
@@ -174,14 +175,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("Завершить диалог", callback_data=f"end_chat_admin_{chat_user_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            f"✅ Вы подключились к чату с @{username} (ID: {chat_user_id})\nПишите сообщения.",
+            f"✅ Вы подключились к чату с @{username} (ID: {chat_user_id})\n\n"
+            f"Все ваши сообщения будут переслаты пользователю.",
             reply_markup=reply_markup
         )
+        
+        logger.info(f"Создан чат: пользователь {chat_user_id} (@{username}) <-> админ {admin_id}")
         return ConversationHandler.END
     
     elif query.data == "end_chat_user":
         if user_id in active_chats:
-            admin_id = active_chats[user_id]
+            admin_id = active_chats[user_id]['admin_id']
             del active_chats[user_id]
             
             try:
@@ -190,6 +194,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             
             await query.edit_message_text("✅ Диалог завершен.")
+            logger.info(f"Чат завершен пользователем {user_id}")
         else:
             await query.answer("У вас нет активного чата", show_alert=True)
         return ConversationHandler.END
@@ -206,6 +211,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             
             await query.edit_message_text("✅ Диалог завершен.")
+            logger.info(f"Чат завершен админом для пользователя {chat_user_id}")
         else:
             await query.answer("Чат уже завершен", show_alert=True)
         return ConversationHandler.END
@@ -244,8 +250,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"{query.message.text}\n\n🔒 Жалоба закрыта")
         return ConversationHandler.END
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка сообщений в чатах"""
+async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ГЛАВНЫЙ обработчик ВСЕХ текстовых сообщений - обрабатывает чаты в первую очередь"""
     if not update.message or not update.message.text:
         return
     
@@ -253,7 +259,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     username = update.message.from_user.username or update.message.from_user.first_name
     
-    # Проверяем, пользователь в чате
+    # ПРИОРИТЕТ 1: Проверяем чат пользователя
     if user_id in active_chats:
         chat_info = active_chats[user_id]
         admin_id = chat_info['admin_id']
@@ -262,12 +268,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=admin_id,
                 text=f"💬 Сообщение от @{username}:\n\n{text}"
             )
-            logger.info(f"Сообщение от пользователя {username} ({user_id}) отправлено админу {admin_id}")
+            logger.info(f"✅ Пользователь {username} ({user_id}) -> Админ {admin_id}: {text[:50]}")
         except Exception as e:
-            logger.error(f"Ошибка отправки админу: {e}")
-        return
+            logger.error(f"❌ Ошибка отправки админу: {e}")
+        return  # ВАЖНО! Блокируем дальнейшую обработку
     
-    # Проверяем, админ в чате
+    # ПРИОРИТЕТ 2: Проверяем чат админа
     for chat_user_id, chat_info in list(active_chats.items()):
         if chat_info['admin_id'] == user_id:
             try:
@@ -277,10 +283,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_user_id,
                     text=f"💬 Администратор @{admin_username}:\n\n{text}"
                 )
-                logger.info(f"Сообщение от админа {username} ({user_id}) отправлено пользователю {user_username} ({chat_user_id})")
+                logger.info(f"✅ Админ {username} ({user_id}) -> Пользователь @{user_username} ({chat_user_id}): {text[:50]}")
             except Exception as e:
-                logger.error(f"Ошибка отправки пользователю: {e}")
-            return
+                logger.error(f"❌ Ошибка отправки пользователю: {e}")
+            return  # ВАЖНО! Блокируем дальнейшую обработку
+    
+    # Если не в чате - игнорируем (обработают другие handlers)
+    logger.info(f"Сообщение от {username} ({user_id}) не в чате, пропускаем")
 
 async def receive_appeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получение обжалования"""
@@ -493,12 +502,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Запуск"""
-    # Запуск Flask в отдельном потоке
+    # Запуск Flask
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
     
     application = Application.builder().token(TOKEN).build()
+    
+    # ВАЖНО: Обработчик чатов должен быть ПЕРВЫМ с высоким приоритетом
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_messages), group=-1)
     
     appeal_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler, pattern="^(appeal|complaint)$")],
@@ -537,17 +549,14 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     
-    # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(appeal_handler)
     application.add_handler(response_handler)
     application.add_handler(ban_handler)
     application.add_handler(addadmin_handler)
     application.add_handler(CallbackQueryHandler(button_handler))
-    # ВАЖНО: handle_message должен быть ПОСЛЕДНИМ с низким приоритетом
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message), group=10)
     
-    logger.info("Бот запущен!")
+    logger.info("🚀 Бот запущен!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
