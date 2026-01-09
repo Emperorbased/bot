@@ -1,6 +1,7 @@
 import logging
 import time
 import os
+import random
 from datetime import datetime, timedelta
 from threading import Thread
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,7 +26,17 @@ WAITING_APPEAL, WAITING_COMPLAINT, WAITING_ADMIN_ID, WAITING_RESPONSE, WAITING_B
 appeals = {}
 appeal_counter = 0
 banned_users = {}
-active_chats = {}  # {user_id: {'admin_id': int, 'username': str, 'admin_username': str}}
+active_chats = {}
+users_data = {}  # {user_id: {'coins': int, 'faith': int, 'last_work': timestamp, 'wins': int, 'losses': int}}
+active_battles = {}  # {battle_id: {'player1': id, 'player2': id, 'bet': int}}
+
+# Работы и их параметры
+JOBS = {
+    'shawarma': {'name': '🌯 Шаурмист', 'pay': (50, 150), 'cooldown': 1800, 'emoji': '🌯'},
+    'watermelon': {'name': '🍉 Продавец арбузов', 'pay': (30, 100), 'cooldown': 1800, 'emoji': '🍉'},
+    'taxi': {'name': '🚕 Таксист', 'pay': (100, 200), 'cooldown': 3600, 'emoji': '🚕'},
+    'kebab': {'name': '🥙 Шашлычник', 'pay': (70, 180), 'cooldown': 2400, 'emoji': '🥙'},
+}
 
 # Flask для Render
 app = Flask(__name__)
@@ -39,12 +50,23 @@ def health():
     return "OK"
 
 def run_flask():
-    """Запуск Flask в отдельном потоке"""
     port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port)
 
+def get_user_data(user_id):
+    """Получить данные пользователя"""
+    if user_id not in users_data:
+        users_data[user_id] = {
+            'coins': 100,  # Стартовые жиркоины
+            'faith': 50,  # Вера в Аллаха (0-100)
+            'last_work': {},  # {job_name: timestamp}
+            'wins': 0,
+            'losses': 0,
+            'total_earned': 0
+        }
+    return users_data[user_id]
+
 def is_user_banned(user_id):
-    """Проверка бана"""
     if user_id in banned_users:
         if time.time() < banned_users[user_id]['until']:
             return True, banned_users[user_id]['reason'], banned_users[user_id]['until']
@@ -53,9 +75,7 @@ def is_user_banned(user_id):
     return False, None, None
 
 def parse_duration(duration_str):
-    """Парсинг времени"""
     duration_str = duration_str.strip().lower()
-    
     if duration_str[-1] == 'm':
         return int(duration_str[:-1]) * 60, f"{duration_str[:-1]} минут(ы)"
     elif duration_str[-1] == 'h':
@@ -66,43 +86,350 @@ def parse_duration(duration_str):
         return None, None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start"""
     user_id = update.message.from_user.id
     
     is_banned, reason, until = is_user_banned(user_id)
     if is_banned:
         ban_end = datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')
-        await update.message.reply_text(
-            f"🚫 Вы заблокированы в боте до {ban_end}\n\n"
-            f"Причина: {reason}"
-        )
+        await update.message.reply_text(f"🚫 Вы заблокированы до {ban_end}\n\nПричина: {reason}")
         return
     
+    user_data = get_user_data(user_id)
+    
     keyboard = [
-        [InlineKeyboardButton("Обжаловать наказание", callback_data="appeal")],
-        [InlineKeyboardButton("Жалоба на персонал", callback_data="complaint")],
-        [InlineKeyboardButton("💬 Чат с администратором", callback_data="start_chat")]
+        [InlineKeyboardButton("📋 Жалобы", callback_data="appeals_menu")],
+        [InlineKeyboardButton("🎮 Игра", callback_data="game_menu")],
+        [InlineKeyboardButton("💬 Чат с админом", callback_data="start_chat")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.message.reply_text(
-        "Привет! Здесь можно обжаловать наказание.\n\n"
-        "Выберите действие:",
+        f"Привет, {update.message.from_user.first_name}! 👋\n\n"
+        f"💰 Жиркоины: {user_data['coins']}\n"
+        f"🙏 Вера в Аллаха: {user_data['faith']}%\n"
+        f"⚔️ Побед/Поражений: {user_data['wins']}/{user_data['losses']}\n\n"
+        f"Выберите раздел:",
         reply_markup=reply_markup
     )
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопок"""
     query = update.callback_query
     await query.answer()
     
     user_id = query.from_user.id
+    user_data = get_user_data(user_id)
     
+    # Меню жалоб
+    if query.data == "appeals_menu":
+        keyboard = [
+            [InlineKeyboardButton("Обжаловать наказание", callback_data="appeal")],
+            [InlineKeyboardButton("Жалоба на персонал", callback_data="complaint")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text("📋 Раздел жалоб:", reply_markup=reply_markup)
+        return
+    
+    # Игровое меню
+    elif query.data == "game_menu":
+        keyboard = [
+            [InlineKeyboardButton("💼 Работа", callback_data="work_menu")],
+            [InlineKeyboardButton("⚔️ Битва", callback_data="battle_menu")],
+            [InlineKeyboardButton("🙏 Молитва", callback_data="pray")],
+            [InlineKeyboardButton("👤 Профиль", callback_data="profile")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="back_to_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            f"🎮 Игровое меню\n\n"
+            f"💰 Жиркоины: {user_data['coins']}\n"
+            f"🙏 Вера: {user_data['faith']}%",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Меню работы
+    elif query.data == "work_menu":
+        keyboard = []
+        for job_key, job in JOBS.items():
+            last_work = user_data['last_work'].get(job_key, 0)
+            cooldown = job['cooldown']
+            time_left = int(cooldown - (time.time() - last_work))
+            
+            if time_left > 0:
+                minutes = time_left // 60
+                button_text = f"{job['emoji']} {job['name']} (⏳ {minutes}м)"
+                callback = f"work_cooldown_{job_key}"
+            else:
+                button_text = f"{job['emoji']} {job['name']} ({job['pay'][0]}-{job['pay'][1]}💰)"
+                callback = f"work_{job_key}"
+            
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=callback)])
+        
+        keyboard.append([InlineKeyboardButton("◀️ Назад", callback_data="game_menu")])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "💼 Выберите работу:\n\n"
+            "Каждая работа имеет откат (cooldown)",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Работа
+    elif query.data.startswith("work_"):
+        if query.data.startswith("work_cooldown_"):
+            await query.answer("⏳ Эта работа ещё недоступна!", show_alert=True)
+            return
+        
+        job_key = query.data.replace("work_", "")
+        job = JOBS[job_key]
+        
+        # Проверка кулдауна
+        last_work = user_data['last_work'].get(job_key, 0)
+        if time.time() - last_work < job['cooldown']:
+            await query.answer("⏳ Слишком рано!", show_alert=True)
+            return
+        
+        # Работа
+        earnings = random.randint(job['pay'][0], job['pay'][1])
+        faith_bonus = int(earnings * (user_data['faith'] / 100))
+        total = earnings + faith_bonus
+        
+        user_data['coins'] += total
+        user_data['total_earned'] += total
+        user_data['last_work'][job_key] = time.time()
+        user_data['faith'] = min(100, user_data['faith'] + random.randint(1, 3))
+        
+        await query.answer(f"💰 Заработано: {total} жиркоинов!", show_alert=True)
+        
+        keyboard = [[InlineKeyboardButton("◀️ К работам", callback_data="work_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"{job['emoji']} {job['name']}\n\n"
+            f"💵 Базовая зарплата: {earnings}\n"
+            f"🙏 Бонус веры: +{faith_bonus}\n"
+            f"💰 Итого: {total} жиркоинов\n\n"
+            f"Ваш баланс: {user_data['coins']} 💰",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Молитва
+    elif query.data == "pray":
+        faith_gain = random.randint(5, 15)
+        coin_bonus = random.randint(0, 50) if user_data['faith'] > 70 else 0
+        
+        user_data['faith'] = min(100, user_data['faith'] + faith_gain)
+        user_data['coins'] += coin_bonus
+        
+        messages = [
+            "🙏 Аллах принял вашу молитву!",
+            "☪️ Вера укрепляется!",
+            "🕌 Благословение получено!",
+            "✨ Аллах доволен вами!"
+        ]
+        
+        keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="game_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        bonus_text = f"\n💰 Бонус: +{coin_bonus} жиркоинов!" if coin_bonus > 0 else ""
+        
+        await query.edit_message_text(
+            f"{random.choice(messages)}\n\n"
+            f"🙏 Вера: +{faith_gain}% (Всего: {user_data['faith']}%){bonus_text}",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Профиль
+    elif query.data == "profile":
+        winrate = (user_data['wins'] / (user_data['wins'] + user_data['losses']) * 100) if (user_data['wins'] + user_data['losses']) > 0 else 0
+        
+        keyboard = [[InlineKeyboardButton("◀️ Назад", callback_data="game_menu")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"👤 Профиль {query.from_user.first_name}\n\n"
+            f"💰 Жиркоины: {user_data['coins']}\n"
+            f"💵 Всего заработано: {user_data['total_earned']}\n"
+            f"🙏 Вера в Аллаха: {user_data['faith']}%\n\n"
+            f"⚔️ Статистика боёв:\n"
+            f"✅ Побед: {user_data['wins']}\n"
+            f"❌ Поражений: {user_data['losses']}\n"
+            f"📊 Винрейт: {winrate:.1f}%",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Меню битвы
+    elif query.data == "battle_menu":
+        keyboard = [
+            [InlineKeyboardButton("⚔️ Создать битву (50💰)", callback_data="create_battle_50")],
+            [InlineKeyboardButton("⚔️ Создать битву (100💰)", callback_data="create_battle_100")],
+            [InlineKeyboardButton("⚔️ Создать битву (200💰)", callback_data="create_battle_200")],
+            [InlineKeyboardButton("🎲 Случайная битва", callback_data="random_battle")],
+            [InlineKeyboardButton("◀️ Назад", callback_data="game_menu")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            "⚔️ Битва игроков\n\n"
+            "Выберите ставку или создайте случайную битву!",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Создание битвы
+    elif query.data.startswith("create_battle_"):
+        bet = int(query.data.split("_")[2])
+        
+        if user_data['coins'] < bet:
+            await query.answer(f"❌ Недостаточно жиркоинов! Нужно: {bet}", show_alert=True)
+            return
+        
+        battle_id = f"{user_id}_{int(time.time())}"
+        active_battles[battle_id] = {
+            'player1': user_id,
+            'player1_name': query.from_user.first_name,
+            'player2': None,
+            'bet': bet,
+            'timestamp': time.time()
+        }
+        
+        user_data['coins'] -= bet
+        
+        keyboard = [[InlineKeyboardButton("❌ Отменить битву", callback_data=f"cancel_battle_{battle_id}")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"⚔️ Битва создана!\n\n"
+            f"💰 Ставка: {bet} жиркоинов\n"
+            f"👤 Создатель: {query.from_user.first_name}\n\n"
+            f"Ожидание соперника...\n"
+            f"ID битвы: {battle_id}",
+            reply_markup=reply_markup
+        )
+        
+        # Уведомляем других игроков
+        for uid in users_data.keys():
+            if uid != user_id and uid not in banned_users:
+                try:
+                    keyboard = [[InlineKeyboardButton("⚔️ Принять бой!", callback_data=f"join_battle_{battle_id}")]]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text=f"⚔️ Новая битва!\n\n"
+                             f"👤 Соперник: {query.from_user.first_name}\n"
+                             f"💰 Ставка: {bet} жиркоинов",
+                        reply_markup=reply_markup
+                    )
+                except:
+                    pass
+        return
+    
+    # Присоединиться к битве
+    elif query.data.startswith("join_battle_"):
+        battle_id = query.data.replace("join_battle_", "")
+        
+        if battle_id not in active_battles:
+            await query.answer("❌ Битва уже завершена!", show_alert=True)
+            return
+        
+        battle = active_battles[battle_id]
+        bet = battle['bet']
+        
+        if user_data['coins'] < bet:
+            await query.answer(f"❌ Недостаточно жиркоинов! Нужно: {bet}", show_alert=True)
+            return
+        
+        if battle['player1'] == user_id:
+            await query.answer("❌ Это ваша битва!", show_alert=True)
+            return
+        
+        user_data['coins'] -= bet
+        
+        player1_id = battle['player1']
+        player1_data = get_user_data(player1_id)
+        
+        # Бой!
+        player1_power = random.randint(1, 100) + player1_data['faith']
+        player2_power = random.randint(1, 100) + user_data['faith']
+        
+        winner_id = player1_id if player1_power > player2_power else user_id
+        loser_id = user_id if winner_id == player1_id else player1_id
+        
+        winner_data = get_user_data(winner_id)
+        loser_data = get_user_data(loser_id)
+        
+        prize = bet * 2
+        winner_data['coins'] += prize
+        winner_data['wins'] += 1
+        loser_data['losses'] += 1
+        
+        winner_name = battle['player1_name'] if winner_id == player1_id else query.from_user.first_name
+        loser_name = query.from_user.first_name if winner_id == player1_id else battle['player1_name']
+        
+        result_text = (
+            f"⚔️ БИТВА ЗАВЕРШЕНА!\n\n"
+            f"👤 {battle['player1_name']} (💪 {player1_power})\n"
+            f"     VS\n"
+            f"👤 {query.from_user.first_name} (💪 {player2_power})\n\n"
+            f"🏆 Победитель: {winner_name}\n"
+            f"💰 Приз: {prize} жиркоинов\n\n"
+            f"💸 Проигравший: {loser_name}"
+        )
+        
+        # Уведомляем обоих
+        try:
+            await context.bot.send_message(chat_id=player1_id, text=result_text)
+        except:
+            pass
+        
+        try:
+            await query.edit_message_text(result_text)
+        except:
+            await context.bot.send_message(chat_id=user_id, text=result_text)
+        
+        del active_battles[battle_id]
+        return
+    
+    # Отмена битвы
+    elif query.data.startswith("cancel_battle_"):
+        battle_id = query.data.replace("cancel_battle_", "")
+        
+        if battle_id in active_battles:
+            battle = active_battles[battle_id]
+            if battle['player1'] == user_id:
+                user_data['coins'] += battle['bet']
+                del active_battles[battle_id]
+                await query.edit_message_text("❌ Битва отменена. Ставка возвращена.")
+        return
+    
+    # Назад в главное меню
+    elif query.data == "back_to_main":
+        keyboard = [
+            [InlineKeyboardButton("📋 Жалобы", callback_data="appeals_menu")],
+            [InlineKeyboardButton("🎮 Игра", callback_data="game_menu")],
+            [InlineKeyboardButton("💬 Чат с админом", callback_data="start_chat")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await query.edit_message_text(
+            f"💰 Жиркоины: {user_data['coins']}\n"
+            f"🙏 Вера: {user_data['faith']}%\n\n"
+            f"Выберите раздел:",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # Жалобы
     if query.data == "appeal":
         is_banned, reason, until = is_user_banned(user_id)
         if is_banned:
             ban_end = datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')
-            await query.edit_message_text(f"🚫 Вы заблокированы в боте до {ban_end}\n\nПричина: {reason}")
+            await query.edit_message_text(f"🚫 Вы заблокированы до {ban_end}\n\nПричина: {reason}")
             return ConversationHandler.END
             
         await query.edit_message_text("📝 Опишите какое наказание вам дали и почему его нужно обжаловать:")
@@ -112,7 +439,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_banned, reason, until = is_user_banned(user_id)
         if is_banned:
             ban_end = datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')
-            await query.edit_message_text(f"🚫 Вы заблокированы в боте до {ban_end}\n\nПричина: {reason}")
+            await query.edit_message_text(f"🚫 Вы заблокированы до {ban_end}\n\nПричина: {reason}")
             return ConversationHandler.END
             
         await query.edit_message_text("📝 Опишите вашу жалобу на персонал:")
@@ -147,7 +474,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⚠️ Этот чат уже занят!", show_alert=True)
             return ConversationHandler.END
         
-        # Создаем чат
         try:
             user_info = await context.bot.get_chat(chat_user_id)
             username = user_info.username if user_info.username else user_info.first_name
@@ -165,8 +491,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup = InlineKeyboardMarkup(keyboard)
             await context.bot.send_message(
                 chat_id=chat_user_id,
-                text=f"💬 Администратор @{query.from_user.username or query.from_user.first_name} подключился к чату!\n\n"
-                     f"Все ваши сообщения теперь будут переслаты администратору.",
+                text=f"💬 Администратор @{query.from_user.username or query.from_user.first_name} подключился к чату!\n\nВсе ваши сообщения теперь будут переслаты администратору.",
                 reply_markup=reply_markup
             )
         except Exception as e:
@@ -175,8 +500,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("Завершить диалог", callback_data=f"end_chat_admin_{chat_user_id}")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            f"✅ Вы подключились к чату с @{username} (ID: {chat_user_id})\n\n"
-            f"Все ваши сообщения будут переслаты пользователю.",
+            f"✅ Вы подключились к чату с @{username} (ID: {chat_user_id})\n\nВсе ваши сообщения будут переслаты пользователю.",
             reply_markup=reply_markup
         )
         
@@ -186,7 +510,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data == "end_chat_user":
         if user_id in active_chats:
             admin_id = active_chats[user_id]['admin_id']
-            del active_chats[user_id]
+           del active_chats[user_id]
             
             try:
                 await context.bot.send_message(chat_id=admin_id, text="💬 Пользователь завершил диалог.")
@@ -227,8 +551,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if appeal_id in appeals:
             context.user_data['banning_appeal'] = appeal_id
             await query.edit_message_text(
-                f"{query.message.text}\n\n"
-                "⏱ Введите время бана:\nПримеры: 1m, 5m, 1h, 12h, 1d, 7d"
+                f"{query.message.text}\n\n⏱ Введите время бана:\nПримеры: 1m, 5m, 1h, 12h, 1d, 7d"
             )
             return WAITING_BAN_DURATION
     
@@ -251,7 +574,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ГЛАВНЫЙ обработчик ВСЕХ текстовых сообщений - обрабатывает чаты в первую очередь"""
+    """ГЛАВНЫЙ обработчик ВСЕХ текстовых сообщений"""
     if not update.message or not update.message.text:
         return
     
@@ -259,7 +582,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text
     username = update.message.from_user.username or update.message.from_user.first_name
     
-    # ПРИОРИТЕТ 1: Проверяем чат пользователя
+    # Чат пользователя
     if user_id in active_chats:
         chat_info = active_chats[user_id]
         admin_id = chat_info['admin_id']
@@ -268,12 +591,12 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                 chat_id=admin_id,
                 text=f"💬 Сообщение от @{username}:\n\n{text}"
             )
-            logger.info(f"✅ Пользователь {username} ({user_id}) -> Админ {admin_id}: {text[:50]}")
+            logger.info(f"✅ Пользователь {username} ({user_id}) -> Админ {admin_id}")
         except Exception as e:
             logger.error(f"❌ Ошибка отправки админу: {e}")
-        return  # ВАЖНО! Блокируем дальнейшую обработку
+        return
     
-    # ПРИОРИТЕТ 2: Проверяем чат админа
+    # Чат админа
     for chat_user_id, chat_info in list(active_chats.items()):
         if chat_info['admin_id'] == user_id:
             try:
@@ -283,16 +606,12 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                     chat_id=chat_user_id,
                     text=f"💬 Администратор @{admin_username}:\n\n{text}"
                 )
-                logger.info(f"✅ Админ {username} ({user_id}) -> Пользователь @{user_username} ({chat_user_id}): {text[:50]}")
+                logger.info(f"✅ Админ {username} ({user_id}) -> Пользователь @{user_username} ({chat_user_id})")
             except Exception as e:
                 logger.error(f"❌ Ошибка отправки пользователю: {e}")
-            return  # ВАЖНО! Блокируем дальнейшую обработку
-    
-    # Если не в чате - игнорируем (обработают другие handlers)
-    logger.info(f"Сообщение от {username} ({user_id}) не в чате, пропускаем")
+            return
 
 async def receive_appeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение обжалования"""
     global appeal_counter
     user_id = update.message.from_user.id
     
@@ -337,7 +656,6 @@ async def receive_appeal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def receive_complaint(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение жалобы"""
     global appeal_counter
     user_id = update.message.from_user.id
     
@@ -382,7 +700,6 @@ async def receive_complaint(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def receive_ban_duration(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение времени бана"""
     duration_str = update.message.text
     appeal_id = context.user_data.get('banning_appeal')
     
@@ -403,7 +720,6 @@ async def receive_ban_duration(update: Update, context: ContextTypes.DEFAULT_TYP
     return WAITING_BAN_REASON
 
 async def receive_ban_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Применение бана"""
     reason = update.message.text
     appeal_id = context.user_data.get('banning_appeal')
     duration = context.user_data.get('ban_duration')
@@ -441,7 +757,6 @@ async def receive_ban_reason(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 async def receive_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ответ админа"""
     appeal_id = context.user_data.get('responding_to')
     
     if appeal_id and appeal_id in appeals:
@@ -465,7 +780,6 @@ async def receive_response(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Добавление админа"""
     user_id = update.message.from_user.id
     
     if user_id not in SUPER_ADMINS:
@@ -476,7 +790,6 @@ async def addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_ADMIN_ID
 
 async def receive_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение ID админа"""
     try:
         new_admin_id = int(update.message.text)
         
@@ -496,12 +809,10 @@ async def receive_admin_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена"""
     await update.message.reply_text("❌ Отменено")
     return ConversationHandler.END
 
 def main():
-    """Запуск"""
     # Запуск Flask
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
@@ -509,7 +820,7 @@ def main():
     
     application = Application.builder().token(TOKEN).build()
     
-    # ВАЖНО: Обработчик чатов должен быть ПЕРВЫМ с высоким приоритетом
+    # Обработчик чатов ПЕРВЫМ
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_messages), group=-1)
     
     appeal_handler = ConversationHandler(
@@ -556,7 +867,7 @@ def main():
     application.add_handler(addadmin_handler)
     application.add_handler(CallbackQueryHandler(button_handler))
     
-    logger.info("🚀 Бот запущен!")
+    logger.info("🚀 Бот запущен с игровой системой!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
