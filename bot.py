@@ -31,6 +31,15 @@ JOBS = {
     'kebab': {'name': '🥙 Шашлычник', 'pay': (70, 180), 'cooldown': 2400},
 }
 
+SHOP_ITEMS = {
+    'vip': {'name': '👑 VIP статус (7 дней)', 'price': 1000, 'type': 'vip'},
+    'faith_boost': {'name': '✨ Усилитель веры +20%', 'price': 500, 'type': 'boost'},
+    'lucky_coin': {'name': '🍀 Счастливая монета x2 заработок', 'price': 800, 'type': 'lucky'},
+    'remove_cd': {'name': '⚡ Убрать кулдауны (1 час)', 'price': 600, 'type': 'no_cd'},
+}
+
+PRAY_COOLDOWN = 1800  # 30 минут
+
 app = Flask(__name__)
 
 @app.route('/')
@@ -47,8 +56,20 @@ def run_flask():
 
 def get_user_data(user_id):
     if user_id not in users_data:
-        users_data[user_id] = {'coins': 100, 'faith': 50, 'last_work': {}, 'wins': 0, 'losses': 0, 'total_earned': 0}
+        users_data[user_id] = {
+            'coins': 100,
+            'faith': 50,
+            'last_work': {},
+            'last_pray': 0,
+            'wins': 0,
+            'losses': 0,
+            'total_earned': 0,
+            'items': {},  # {'vip': timestamp, 'no_cd': timestamp}
+        }
     return users_data[user_id]
+
+def is_admin(user_id):
+    return user_id in admins
 
 def is_user_banned(user_id):
     if user_id in banned_users and time.time() < banned_users[user_id]['until']:
@@ -67,6 +88,14 @@ def parse_duration(duration_str):
         return int(duration_str[:-1]) * 86400, f"{duration_str[:-1]} д"
     return None, None
 
+def has_item_active(user_data, item_type):
+    if item_type in user_data['items']:
+        if time.time() < user_data['items'][item_type]:
+            return True
+        else:
+            del user_data['items'][item_type]
+    return False
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.from_user.id
     is_banned, reason, until = is_user_banned(user_id)
@@ -75,12 +104,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     user_data = get_user_data(user_id)
+    vip_status = "👑 VIP" if has_item_active(user_data, 'vip') else ""
+    
     keyboard = [
         [InlineKeyboardButton("📋 Жалобы", callback_data="appeals_menu"), InlineKeyboardButton("🎮 Игра", callback_data="game_menu")],
-        [InlineKeyboardButton("💬 Чат с админом", callback_data="start_chat")]
+        [InlineKeyboardButton("🛒 Магазин", callback_data="shop_menu"), InlineKeyboardButton("💬 Чат", callback_data="start_chat")]
     ]
     await update.message.reply_text(
-        f"👋 Привет!\n\n💰 {user_data['coins']} | 🙏 {user_data['faith']}% | ⚔️ {user_data['wins']}/{user_data['losses']}",
+        f"👋 Привет! {vip_status}\n\n💰 {user_data['coins']} | 🙏 {user_data['faith']}% | ⚔️ {user_data['wins']}/{user_data['losses']}",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
@@ -90,7 +121,8 @@ async def top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, (uid, data) in enumerate(top_coins, 1):
         try:
             user = await context.bot.get_chat(uid)
-            text += f"{i}. {user.first_name}: {data['coins']}💰\n"
+            vip = "👑" if has_item_active(data, 'vip') else ""
+            text += f"{i}. {user.first_name} {vip}: {data['coins']}💰\n"
         except:
             text += f"{i}. ID{uid}: {data['coins']}💰\n"
     await update.message.reply_text(text)
@@ -102,24 +134,44 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def work_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user_data(update.message.from_user.id)
+    user_id = update.message.from_user.id
+    user_data = get_user_data(user_id)
+    no_cd = is_admin(user_id) or has_item_active(user_data, 'no_cd')
+    
     keyboard = []
     for job_key, job in JOBS.items():
         last = user_data['last_work'].get(job_key, 0)
         left = int(job['cooldown'] - (time.time() - last))
-        if left > 0:
-            keyboard.append([InlineKeyboardButton(f"{job['name']} ⏳{left//60}м", callback_data=f"work_cd")])
-        else:
+        
+        if no_cd or left <= 0:
             keyboard.append([InlineKeyboardButton(f"{job['name']} ({job['pay'][0]}-{job['pay'][1]}💰)", callback_data=f"work_{job_key}")])
+        else:
+            keyboard.append([InlineKeyboardButton(f"{job['name']} ⏳{left//60}м", callback_data="work_cd")])
+    
     await update.message.reply_text("💼 Работы:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def pray(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_data = get_user_data(update.message.from_user.id)
+    user_id = update.message.from_user.id
+    user_data = get_user_data(user_id)
+    
+    # Проверка кулдауна (кроме админов)
+    if not is_admin(user_id):
+        last_pray = user_data.get('last_pray', 0)
+        time_left = int(PRAY_COOLDOWN - (time.time() - last_pray))
+        if time_left > 0:
+            await update.message.reply_text(f"🙏 Молитва доступна через {time_left//60} минут")
+            return
+    
     faith_gain = random.randint(5, 15)
     user_data['faith'] = min(100, user_data['faith'] + faith_gain)
     coin_bonus = random.randint(0, 50) if user_data['faith'] > 70 else 0
     user_data['coins'] += coin_bonus
-    await update.message.reply_text(f"🙏 +{faith_gain}% веры (Всего: {user_data['faith']}%)" + (f"\n💰 Бонус: +{coin_bonus}" if coin_bonus else ""))
+    user_data['last_pray'] = time.time()
+    
+    await update.message.reply_text(
+        f"🙏 +{faith_gain}% веры (Всего: {user_data['faith']}%)" + 
+        (f"\n💰 Бонус: +{coin_bonus}" if coin_bonus else "")
+    )
 
 async def battle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -129,15 +181,27 @@ async def battle_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text("⚔️ Выберите ставку:", reply_markup=InlineKeyboardMarkup(keyboard))
 
+async def shop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_data = get_user_data(update.message.from_user.id)
+    keyboard = []
+    for item_key, item in SHOP_ITEMS.items():
+        keyboard.append([InlineKeyboardButton(f"{item['name']} - {item['price']}💰", callback_data=f"buy_{item_key}")])
+    
+    await update.message.reply_text(
+        f"🛒 МАГАЗИН\n\nВаш баланс: {user_data['coins']}💰",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = get_user_data(update.inline_query.from_user.id)
+    vip = "👑" if has_item_active(user_data, 'vip') else ""
     results = [
         InlineQueryResultArticle(
             id='profile',
-            title='👤 Профиль',
+            title=f'👤 Профиль {vip}',
             description=f'{user_data["coins"]}💰 | {user_data["faith"]}%🙏',
             input_message_content=InputTextMessageContent(
-                f"👤 Профиль\n\n💰 {user_data['coins']}\n🙏 {user_data['faith']}%\n⚔️ {user_data['wins']}/{user_data['losses']}"
+                f"👤 Профиль {vip}\n\n💰 {user_data['coins']}\n🙏 {user_data['faith']}%\n⚔️ {user_data['wins']}/{user_data['losses']}"
             )
         )
     ]
@@ -167,15 +231,73 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"🎮 Игра\n\n💰 {user_data['coins']} | 🙏 {user_data['faith']}%", reply_markup=InlineKeyboardMarkup(keyboard))
         return
     
+    elif query.data == "shop_menu":
+        keyboard = []
+        for item_key, item in SHOP_ITEMS.items():
+            active = ""
+            if has_item_active(user_data, item['type']):
+                time_left = int((user_data['items'][item['type']] - time.time()) / 60)
+                active = f" ✅ ({time_left}м)"
+            keyboard.append([InlineKeyboardButton(f"{item['name']} - {item['price']}💰{active}", callback_data=f"buy_{item_key}")])
+        keyboard.append([InlineKeyboardButton("◀️", callback_data="back_to_main")])
+        
+        await query.edit_message_text(
+            f"🛒 МАГАЗИН\n\nВаш баланс: {user_data['coins']}💰",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
+    elif query.data.startswith("buy_"):
+        item_key = query.data.replace("buy_", "")
+        item = SHOP_ITEMS[item_key]
+        
+        if user_data['coins'] < item['price']:
+            await query.answer(f"❌ Недостаточно! Нужно {item['price']}💰", show_alert=True)
+            return
+        
+        user_data['coins'] -= item['price']
+        
+        # Активация предмета
+        if item['type'] == 'vip':
+            user_data['items']['vip'] = time.time() + (7 * 86400)  # 7 дней
+            await query.answer("👑 VIP активирован на 7 дней!", show_alert=True)
+        elif item['type'] == 'boost':
+            user_data['faith'] = min(100, user_data['faith'] + 20)
+            await query.answer("✨ Вера увеличена на 20%!", show_alert=True)
+        elif item['type'] == 'lucky':
+            user_data['items']['lucky'] = time.time() + 3600  # 1 час
+            await query.answer("🍀 Удвоенный заработок на 1 час!", show_alert=True)
+        elif item['type'] == 'no_cd':
+            user_data['items']['no_cd'] = time.time() + 3600  # 1 час
+            await query.answer("⚡ Кулдауны убраны на 1 час!", show_alert=True)
+        
+        # Обновляем магазин
+        keyboard = []
+        for ik, it in SHOP_ITEMS.items():
+            active = ""
+            if has_item_active(user_data, it['type']):
+                time_left = int((user_data['items'][it['type']] - time.time()) / 60)
+                active = f" ✅ ({time_left}м)"
+            keyboard.append([InlineKeyboardButton(f"{it['name']} - {it['price']}💰{active}", callback_data=f"buy_{ik}")])
+        keyboard.append([InlineKeyboardButton("◀️", callback_data="back_to_main")])
+        
+        await query.edit_message_text(
+            f"🛒 МАГАЗИН\n\nВаш баланс: {user_data['coins']}💰",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
     elif query.data == "work_menu":
+        no_cd = is_admin(user_id) or has_item_active(user_data, 'no_cd')
         keyboard = []
         for job_key, job in JOBS.items():
             last = user_data['last_work'].get(job_key, 0)
             left = int(job['cooldown'] - (time.time() - last))
-            if left > 0:
-                keyboard.append([InlineKeyboardButton(f"{job['name']} ⏳{left//60}м", callback_data="work_cd")])
-            else:
+            
+            if no_cd or left <= 0:
                 keyboard.append([InlineKeyboardButton(f"{job['name']} ({job['pay'][0]}-{job['pay'][1]}💰)", callback_data=f"work_{job_key}")])
+            else:
+                keyboard.append([InlineKeyboardButton(f"{job['name']} ⏳{left//60}м", callback_data="work_cd")])
         keyboard.append([InlineKeyboardButton("◀️", callback_data="game_menu")])
         await query.edit_message_text("💼 Работы:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -183,42 +305,75 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("work_") and query.data != "work_cd" and query.data != "work_menu":
         job_key = query.data.replace("work_", "")
         job = JOBS[job_key]
-        last = user_data['last_work'].get(job_key, 0)
-        if time.time() - last < job['cooldown']:
-            await query.answer("⏳ Слишком рано!", show_alert=True)
-            return
+        
+        # Проверка кулдауна (кроме админов и владельцев no_cd)
+        no_cd = is_admin(user_id) or has_item_active(user_data, 'no_cd')
+        if not no_cd:
+            last = user_data['last_work'].get(job_key, 0)
+            if time.time() - last < job['cooldown']:
+                await query.answer("⏳ Слишком рано!", show_alert=True)
+                return
+        
         earnings = random.randint(job['pay'][0], job['pay'][1])
         bonus = int(earnings * (user_data['faith'] / 100))
+        
+        # Удвоение от lucky coin
+        if has_item_active(user_data, 'lucky'):
+            earnings *= 2
+            bonus *= 2
+        
         total = earnings + bonus
         user_data['coins'] += total
         user_data['total_earned'] += total
         user_data['last_work'][job_key] = time.time()
         user_data['faith'] = min(100, user_data['faith'] + random.randint(1, 3))
+        
         await query.answer(f"💰 +{total}!", show_alert=True)
         keyboard = [[InlineKeyboardButton("◀️ К работам", callback_data="work_menu")]]
+        lucky_text = " 🍀x2" if has_item_active(user_data, 'lucky') else ""
         await query.edit_message_text(
-            f"{job['name']}\n\n💵 {earnings}\n🙏 Бонус: +{bonus}\n💰 Итого: {total}\n\nБаланс: {user_data['coins']}💰",
+            f"{job['name']}{lucky_text}\n\n💵 {earnings}\n🙏 Бонус: +{bonus}\n💰 Итого: {total}\n\nБаланс: {user_data['coins']}💰",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
     
     elif query.data == "pray":
+        # Проверка кулдауна (кроме админов)
+        if not is_admin(user_id):
+            last_pray = user_data.get('last_pray', 0)
+            time_left = int(PRAY_COOLDOWN - (time.time() - last_pray))
+            if time_left > 0:
+                await query.answer(f"🙏 Доступно через {time_left//60} минут", show_alert=True)
+                return
+        
         faith_gain = random.randint(5, 15)
         coin_bonus = random.randint(0, 50) if user_data['faith'] > 70 else 0
         user_data['faith'] = min(100, user_data['faith'] + faith_gain)
         user_data['coins'] += coin_bonus
+        user_data['last_pray'] = time.time()
+        
         keyboard = [[InlineKeyboardButton("◀️", callback_data="game_menu")]]
         await query.edit_message_text(
-            f"🙏 Молитва принята!\n\n+{faith_gain}% веры (Всего: {user_data['faith']}%)" + (f"\n💰 Бонус: +{coin_bonus}" if coin_bonus else ""),
+            f"🙏 Молитва принята!\n\n+{faith_gain}% веры (Всего: {user_data['faith']}%)" + 
+            (f"\n💰 Бонус: +{coin_bonus}" if coin_bonus else ""),
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
     
     elif query.data == "profile":
         winrate = (user_data['wins'] / (user_data['wins'] + user_data['losses']) * 100) if (user_data['wins'] + user_data['losses']) > 0 else 0
+        vip_status = "👑 VIP" if has_item_active(user_data, 'vip') else ""
+        admin_status = "⭐ ADMIN" if is_admin(user_id) else ""
+        
         keyboard = [[InlineKeyboardButton("◀️", callback_data="game_menu")]]
         await query.edit_message_text(
-            f"👤 Профиль\n\n💰 {user_data['coins']}\n💵 Заработано: {user_data['total_earned']}\n🙏 Вера: {user_data['faith']}%\n\n⚔️ Побед: {user_data['wins']}\n💀 Поражений: {user_data['losses']}\n📊 Винрейт: {winrate:.1f}%",
+            f"👤 Профиль {vip_status} {admin_status}\n\n"
+            f"💰 {user_data['coins']}\n"
+            f"💵 Заработано: {user_data['total_earned']}\n"
+            f"🙏 Вера: {user_data['faith']}%\n\n"
+            f"⚔️ Побед: {user_data['wins']}\n"
+            f"💀 Поражений: {user_data['losses']}\n"
+            f"📊 Винрейт: {winrate:.1f}%",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         return
@@ -229,7 +384,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for i, (uid, data) in enumerate(top_coins, 1):
             try:
                 user = await context.bot.get_chat(uid)
-                text += f"{i}. {user.first_name}: {data['coins']}💰\n"
+                vip = "👑" if has_item_active(data, 'vip') else ""
+                text += f"{i}. {user.first_name} {vip}: {data['coins']}💰\n"
             except:
                 text += f"{i}. ID{uid}: {data['coins']}💰\n"
         keyboard = [[InlineKeyboardButton("◀️", callback_data="game_menu")]]
@@ -237,13 +393,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     elif query.data == "battle_menu":
+        # Показать доступные битвы
+        available_battles = []
+        for battle_id, battle in active_battles.items():
+            if battle['player2'] is None and battle['player1'] != user_id:
+                available_battles.append((battle_id, battle))
+        
+        keyboard = []
+        if available_battles:
+            for battle_id, battle in available_battles[:3]:  # Показываем до 3 битв
+                keyboard.append([InlineKeyboardButton(
+                    f"⚔️ {battle['player1_name']} - {battle['bet']}💰",
+                    callback_data=f"join_battle_{battle_id}"
+                )])
+        
+        keyboard.append([InlineKeyboardButton("➕ Создать битву", callback_data="create_battle_menu")])
+        keyboard.append([InlineKeyboardButton("◀️", callback_data="game_menu")])
+        
+        await query.edit_message_text("⚔️ Битвы:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
+    elif query.data == "create_battle_menu":
         keyboard = [
             [InlineKeyboardButton("⚔️ 50💰", callback_data="create_battle_50")],
             [InlineKeyboardButton("⚔️ 100💰", callback_data="create_battle_100")],
             [InlineKeyboardButton("⚔️ 200💰", callback_data="create_battle_200")],
-            [InlineKeyboardButton("◀️", callback_data="game_menu")]
+            [InlineKeyboardButton("◀️", callback_data="battle_menu")]
         ]
-        await query.edit_message_text("⚔️ Битва:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("⚔️ Выберите ставку:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
     
     elif query.data.startswith("create_battle_"):
@@ -251,15 +428,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user_data['coins'] < bet:
             await query.answer(f"❌ Нужно {bet}💰", show_alert=True)
             return
+        
         battle_id = f"{user_id}_{int(time.time())}"
-        active_battles[battle_id] = {'player1': user_id, 'player1_name': query.from_user.first_name, 'player2': None, 'bet': bet}
+        active_battles[battle_id] = {
+            'player1': user_id,
+            'player1_name': query.from_user.first_name,
+            'player2': None,
+            'bet': bet
+        }
         user_data['coins'] -= bet
-        keyboard = [[InlineKeyboardButton("❌ Отменить", callback_data=f"cancel_battle_{battle_id}")]]
-        await query.edit_message_text(f"⚔️ Битва создана!\n\n💰 Ставка: {bet}\n👤 {query.from_user.first_name}\n\nОжидание...", reply_markup=InlineKeyboardMarkup(keyboard))
-        for uid in users_data.keys():
+        
+        await query.edit_message_text(
+            f"⚔️ Битва создана!\n\n💰 Ставка: {bet}\n👤 {query.from_user.first_name}\n\nОжидание соперника..."
+        )
+        
+        # Уведомляем других игроков
+        for uid in list(users_data.keys())[:10]:  # Уведомляем первых 10
             if uid != user_id:
                 try:
-                    await context.bot.send_message(uid, f"⚔️ Битва!\n\n👤 {query.from_user.first_name}\n💰 {bet}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚔️ Принять!", callback_data=f"join_battle_{battle_id}")]]))
+                    keyboard_notif = [[InlineKeyboardButton("⚔️ Принять бой!", callback_data=f"join_battle_{battle_id}")]]
+                    await context.bot.send_message(
+                        uid,
+                        f"⚔️ Новая битва!\n\n👤 {query.from_user.first_name}\n💰 {bet}",
+                        reply_markup=InlineKeyboardMarkup(keyboard_notif)
+                    )
                 except:
                     pass
         return
@@ -267,61 +459,75 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith("join_battle_"):
         battle_id = query.data.replace("join_battle_", "")
         if battle_id not in active_battles:
-            await query.answer("❌ Битва завершена", show_alert=True)
+            await query.answer("❌ Битва уже завершена", show_alert=True)
             return
+        
         battle = active_battles[battle_id]
         bet = battle['bet']
+        
         if user_data['coins'] < bet:
             await query.answer(f"❌ Нужно {bet}💰", show_alert=True)
             return
+        
         if battle['player1'] == user_id:
             await query.answer("❌ Это ваша битва!", show_alert=True)
             return
+        
         user_data['coins'] -= bet
         player1_data = get_user_data(battle['player1'])
+        
+        # Бой!
         p1_power = random.randint(1, 100) + player1_data['faith']
         p2_power = random.randint(1, 100) + user_data['faith']
+        
         winner_id = battle['player1'] if p1_power > p2_power else user_id
         loser_id = user_id if winner_id == battle['player1'] else battle['player1']
+        
         winner_data = get_user_data(winner_id)
         loser_data = get_user_data(loser_id)
+        
         prize = bet * 2
         winner_data['coins'] += prize
         winner_data['wins'] += 1
         loser_data['losses'] += 1
+        
         winner_name = battle['player1_name'] if winner_id == battle['player1'] else query.from_user.first_name
         loser_name = query.from_user.first_name if winner_id == battle['player1'] else battle['player1_name']
-        result = f"⚔️ БИТВА!\n\n{battle['player1_name']} ({p1_power}) VS {query.from_user.first_name} ({p2_power})\n\n🏆 {winner_name}\n💰 {prize}"
+        
+        result = (
+            f"⚔️ БИТВА ЗАВЕРШЕНА!\n\n"
+            f"{battle['player1_name']} (💪{p1_power}) VS {query.from_user.first_name} (💪{p2_power})\n\n"
+            f"🏆 Победитель: {winner_name}\n"
+            f"💰 Приз: {prize}\n\n"
+            f"💸 Проигравший: {loser_name}"
+        )
+        
         try:
             await context.bot.send_message(battle['player1'], result)
         except:
             pass
+        
         try:
             await query.edit_message_text(result)
         except:
             await context.bot.send_message(user_id, result)
+        
         del active_battles[battle_id]
         return
     
-    elif query.data.startswith("cancel_battle_"):
-        battle_id = query.data.replace("cancel_battle_", "")
-        if battle_id in active_battles:
-            battle = active_battles[battle_id]
-            if battle['player1'] == user_id:
-                user_data['coins'] += battle['bet']
-                del active_battles[battle_id]
-                await query.edit_message_text("❌ Битва отменена")
-        return
-    
     elif query.data == "back_to_main":
+        vip_status = "👑 VIP" if has_item_active(user_data, 'vip') else ""
         keyboard = [
             [InlineKeyboardButton("📋 Жалобы", callback_data="appeals_menu"), InlineKeyboardButton("🎮 Игра", callback_data="game_menu")],
-            [InlineKeyboardButton("💬 Чат", callback_data="start_chat")]
+            [InlineKeyboardButton("🛒 Магазин", callback_data="shop_menu"), InlineKeyboardButton("💬 Чат", callback_data="start_chat")]
         ]
-        await query.edit_message_text(f"💰 {user_data['coins']} | 🙏 {user_data['faith']}%", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text(
+            f"💰 {user_data['coins']} | 🙏 {user_data['faith']}% {vip_status}",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         return
     
-    # Жалобы и чаты (остальное остается как было)
+    # Остальные handlers для жалоб и чатов (как раньше)
     if query.data == "appeal":
         await query.edit_message_text("📝 Опишите наказание:")
         return WAITING_APPEAL
@@ -518,21 +724,18 @@ def main():
     
     application = Application.builder().token(TOKEN).build()
     
-    # Чаты ПЕРВЫМИ
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_all_messages), group=-1)
     
-    # Команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("top", top))
     application.add_handler(CommandHandler("balance", balance))
     application.add_handler(CommandHandler("work", work_cmd))
     application.add_handler(CommandHandler("battle", battle_cmd))
     application.add_handler(CommandHandler("pray", pray))
+    application.add_handler(CommandHandler("shop", shop_cmd))
     
-    # Inline для групп
     application.add_handler(InlineQueryHandler(inline_query))
     
-    # ConversationHandlers
     appeal_handler = ConversationHandler(
         entry_points=[CallbackQueryHandler(button_handler, pattern="^(appeal|complaint)$")],
         states={
@@ -576,7 +779,7 @@ def main():
     application.add_handler(addadmin_handler)
     application.add_handler(CallbackQueryHandler(button_handler))
     
-    logger.info("🚀 Бот запущен с игровой системой!")
+    logger.info("🚀 Бот запущен с магазином!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
